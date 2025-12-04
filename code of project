@@ -1,0 +1,488 @@
+#include <Arduino.h>
+
+// Platform detection
+#if defined(ESP8266)
+  #include <ESP8266WiFi.h>
+  #include <ESP8266HTTPClient.h>
+  #include <ESP8266mDNS.h>
+  #include <WiFiUdp.h>
+  #include <ESP8266WebServer.h>
+#elif defined(ESP32)
+  #include <WiFi.h>
+  #include <HTTPClient.h>
+  #include <WiFiUdp.h>
+  #include <ArduinoOTA.h>
+  #include "esp_sleep.h"
+#else
+  #error This sketch supports only ESP8266 or ESP32.
+#endif
+
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
+#include <ArduinoJson.h>
+#include <PubSubClient.h>      // optional: MQTT
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <time.h>
+
+// ---------------- User Configuration ----------------
+
+// WiFi
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+
+// ThingSpeak
+const char* THINGSPEAK_WRITE_APIKEY = "YOUR_THINGSPEAK_WRITE_APIKEY";  // write key
+const char* THINGSPEAK_SERVER = "api.thingspeak.com";
+const uint16_t THINGSPEAK_PORT = 80;
+const unsigned long THINGSPEAK_UPDATE_INTERVAL_MS = 2UL * 60UL * 1000UL; // 2 minutes default (ThingSpeak free limit: 15 sec min but don't spam)
+
+// MQTT (optional)
+const bool USE_MQTT = false;
+const char* MQTT_BROKER = "broker.hivemq.com";
+const uint16_t MQTT_PORT = 1883;
+const char* MQTT_TOPIC_PREFIX = "weatherstation/device001"; // example
+
+// OLED display
+const bool USE_OLED = true;
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// Sensor pins
+#if defined(ESP8266)
+  const int PIN_MQ135 = A0;  // NodeMCU A0
+  const int PIN_BATT = A0;   // if you share, read carefully (use separate analog input if available)
+#elif defined(ESP32)
+  const int PIN_MQ135 = 34;  // ADC1_CH6 (input only)
+  const int PIN_BATT = 35;   // ADC1_CH7
+#endif
+
+// ADC / Voltage divider calibration
+// Vbat = ADC_read * ADC_MULTIPLIER
+// ADC_MULTIPLIER = (Vref / ADC_MAX) * (R1+R2)/R2 depending on divider
+// Adjust these constants to match your hardware
+#if defined(ESP8266)
+  const float ADC_MAX = 1023.0;    // ESP8266 A0 full scale (commonly 0-1V w/ onboard divider)
+  const float VREF = 3.2;         // effective Vref after NodeMCU divider (check your board or measure)
+  const float VBAT_DIVIDER_RATIO = 2.0; // if you used 100k/100k => divide by 2
+#elif defined(ESP32)
+  const float ADC_MAX = 4095.0;
+  const float VREF = 3.3;          // ADC reference / full scale voltage (approx)
+  const float VBAT_DIVIDER_RATIO = 3.0; // Example: if you used 200k/100k -> (R1+R2)/R2 = 3
+#endif
+
+// Deep sleep option
+const bool USE_DEEP_SLEEP = false;  // set true to enable deep sleep between cycles
+const uint64_t DEEP_SLEEP_SECONDS = 600; // sleep interval (seconds) when deep sleep enabled
+
+// Reading intervals and smoothing
+const unsigned long SENSOR_READ_INTERVAL_MS = 30UL * 1000UL; // how often to take readings (if not deep sleep)
+const float EMA_ALPHA = 0.2; // EMA smoothing factor (0..1): higher = faster to changes
+
+// BME280 I2C address (commonly 0x76 or 0x77)
+#define BME280_I2C_ADDRESS 0x76
+
+// OTA hostname
+const char* OTA_HOSTNAME = "WeatherStation-001";
+
+// ---------- End User Configuration ----------
+
+// Globals
+Adafruit_BME280 bme; // I2C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+WiFiClient wifiClient;
+#if defined(ESP8266)
+  PubSubClient mqttClient(wifiClient);
+#elif defined(ESP32)
+  PubSubClient mqttClient(wifiClient);
+#endif
+
+// EMA state
+float emaTemperature = NAN;
+float emaHumidity = NAN;
+float emaPressure = NAN;
+float emaMQ135 = NAN;
+float emaBattery = NAN;
+
+// Timing
+unsigned long lastSensorRead = 0;
+unsigned long lastThingSpeakUpdate = 0;
+
+// Forward declarations
+void connectWiFi();
+void setupOTA();
+void publishToThingSpeak(float temperature, float humidity, float pressure, float mqRaw, float vbatt);
+void publishToMQTT(float temperature, float humidity, float pressure, float mqRaw, float vbatt);
+float readBatteryVoltage();
+float readMQ135Raw();
+void displayStatus(float temperature, float humidity, float pressure, float mqRaw, float vbatt);
+void doDeepSleep();
+
+// Helper: robust millis wait for wifi
+bool ensureWiFiConnected(unsigned long timeoutMs=30000) {
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(250);
+    yield();
+  }
+  return WiFi.status() == WL_CONNECTED;
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("\n\n=== IoT Solar WiFi Weather Station ===");
+
+  // I2C init
+  Wire.begin();
+
+  // Initialize OLED if used
+  if (USE_OLED) {
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Common I2C address 0x3C
+      Serial.println("SSD1306 allocation failed");
+      // proceed without display
+    } else {
+      display.clearDisplay();
+      display.setTextSize(1);
+      display.setTextColor(WHITE);
+      display.setCursor(0,0);
+      display.println("Weather Station");
+      display.display();
+    }
+  }
+
+  // Initialize BME280
+  bool bmeOK = bme.begin(BME280_I2C_ADDRESS);
+  if (!bmeOK) {
+    Serial.println("Could not find BME280 sensor!");
+    if (USE_OLED) {
+      display.clearDisplay();
+      display.setCursor(0,0);
+      display.println("BME280 not found!");
+      display.display();
+    }
+  } else {
+    Serial.println("BME280 initialized.");
+  }
+
+  // Setup WiFi
+  connectWiFi();
+
+  // OTA init
+  setupOTA();
+
+  // MQTT setup if used
+  if (USE_MQTT) {
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+  }
+
+  // Initialize EMA baseline using first readings to avoid NAN
+  float t = NAN, h = NAN, p = NAN, mq = NAN, vb = NAN;
+  if (bmeOK) {
+    t = bme.readTemperature();
+    h = bme.readHumidity();
+    p = bme.readPressure() / 100.0F;
+  } else {
+    t = -999;
+    h = -999;
+    p = -999;
+  }
+  mq = readMQ135Raw();
+  vb = readBatteryVoltage();
+
+  emaTemperature = t;
+  emaHumidity = h;
+  emaPressure = p;
+  emaMQ135 = mq;
+  emaBattery = vb;
+
+  lastSensorRead = millis() - SENSOR_READ_INTERVAL_MS; // force immediate first read
+  lastThingSpeakUpdate = millis() - THINGSPEAK_UPDATE_INTERVAL_MS;
+
+  Serial.println("Setup complete.");
+}
+
+void loop() {
+  // Handle OTA in loop
+  #if defined(ESP8266) || defined(ESP32)
+    ArduinoOTA.handle();
+  #endif
+
+  // Reconnect WiFi if needed
+  if (WiFi.status() != WL_CONNECTED) {
+    connectWiFi();
+  }
+
+  // MQTT loop
+  if (USE_MQTT) {
+    if (!mqttClient.connected()) {
+      // try to connect
+      Serial.println("Connecting MQTT...");
+      if (mqttClient.connect("weatherstationClient")) {
+        Serial.println("MQTT connected.");
+      } else {
+        Serial.println("MQTT connect failed.");
+      }
+    } else {
+      mqttClient.loop();
+    }
+  }
+
+  // Periodic sensor read (or deep sleep will handle)
+  unsigned long now = millis();
+  if (now - lastSensorRead >= SENSOR_READ_INTERVAL_MS) {
+    lastSensorRead = now;
+
+    // Read sensors
+    float temperature = NAN, humidity = NAN, pressure = NAN;
+    if (bme.begin(BME280_I2C_ADDRESS)) { // ensure sensor present
+      temperature = bme.readTemperature();
+      humidity = bme.readHumidity();
+      pressure = bme.readPressure() / 100.0F; // hPa
+    } else {
+      Serial.println("Warning: BME280 not responding on read.");
+    }
+
+    float mqRaw = readMQ135Raw();
+    float batteryVolts = readBatteryVoltage();
+
+    // Update EMAs
+    if (!isnan(temperature)) emaTemperature = EMA_ALPHA * temperature + (1.0 - EMA_ALPHA) * emaTemperature;
+    if (!isnan(humidity))    emaHumidity = EMA_ALPHA * humidity + (1.0 - EMA_ALPHA) * emaHumidity;
+    if (!isnan(pressure))    emaPressure = EMA_ALPHA * pressure + (1.0 - EMA_ALPHA) * emaPressure;
+    if (!isnan(mqRaw))       emaMQ135 = EMA_ALPHA * mqRaw + (1.0 - EMA_ALPHA) * emaMQ135;
+    if (!isnan(batteryVolts))emaBattery = EMA_ALPHA * batteryVolts + (1.0 - EMA_ALPHA) * emaBattery;
+
+    Serial.printf("Sensor read -> T: %.2f C, H: %.2f %%, P: %.2f hPa, MQ: %.1f (raw), Vbat: %.2f V\n",
+                  emaTemperature, emaHumidity, emaPressure, emaMQ135, emaBattery);
+
+    // Display
+    if (USE_OLED) displayStatus(emaTemperature, emaHumidity, emaPressure, emaMQ135, emaBattery);
+
+    // Publish to ThingSpeak at defined interval
+    if (now - lastThingSpeakUpdate >= THINGSPEAK_UPDATE_INTERVAL_MS) {
+      lastThingSpeakUpdate = now;
+      if (WiFi.status() == WL_CONNECTED) {
+        publishToThingSpeak(emaTemperature, emaHumidity, emaPressure, emaMQ135, emaBattery);
+      } else {
+        Serial.println("Not connected to WiFi. Skipping ThingSpeak publish.");
+      }
+
+      if (USE_MQTT && WiFi.status() == WL_CONNECTED) {
+        publishToMQTT(emaTemperature, emaHumidity, emaPressure, emaMQ135, emaBattery);
+      }
+    }
+
+    // If deep sleep is desired, enter now
+    if (USE_DEEP_SLEEP) {
+      Serial.println("Entering deep sleep to save power...");
+      delay(200); // allow serial prints
+      doDeepSleep();
+    }
+  }
+
+  delay(10);
+}
+
+// ---------- Functions ----------
+
+void connectWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.printf("Connecting to WiFi: %s\n", WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  unsigned long start = millis();
+  const unsigned long timeout = 20000; // 20s connect timeout
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeout) {
+    delay(250);
+    Serial.print(".");
+    yield();
+  }
+  Serial.println();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("WiFi connected. IP: %s\n", WiFi.localIP().toString().c_str());
+    // NTP time sync
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov");
+    // optional: wait for time
+    time_t now = time(nullptr);
+    if (now < 100000) {
+      Serial.println("Waiting for NTP time...");
+      unsigned long start2 = millis();
+      while ((time(nullptr) < 100000) && (millis() - start2 < 5000)) {
+        delay(200);
+      }
+    }
+    #if defined(ESP8266)
+      // Start OTA for ESP8266
+      ArduinoOTA.setHostname(OTA_HOSTNAME);
+      ArduinoOTA.begin();
+    #elif defined(ESP32)
+      // ArduinoOTA setup handled by setupOTA(); ensure it's called
+    #endif
+  } else {
+    Serial.println("WiFi connection failed.");
+    if (USE_OLED) {
+      display.clearDisplay();
+      display.setCursor(0,0);
+      display.println("WiFi Failed");
+      display.display();
+    }
+  }
+}
+
+void setupOTA() {
+  #if defined(ESP8266) || defined(ESP32)
+    // Basic OTA setup with default password (change for security)
+    ArduinoOTA.setHostname(OTA_HOSTNAME);
+    ArduinoOTA.onStart([]() {
+      Serial.println("OTA Start");
+      if (USE_OLED) {
+        display.clearDisplay();
+        display.setCursor(0,0);
+        display.println("OTA Start");
+        display.display();
+      }
+    });
+    ArduinoOTA.onEnd([]() {
+      Serial.println("\nOTA End");
+      if (USE_OLED) {
+        display.clearDisplay();
+        display.setCursor(0,0);
+        display.println("OTA End");
+        display.display();
+      }
+    });
+    ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
+      Serial.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
+    });
+    ArduinoOTA.onError([](ota_error_t error) {
+      Serial.printf("OTA Error[%u]: ", error);
+      if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+      else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+      else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+      else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+      else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    });
+    ArduinoOTA.begin();
+    Serial.println("OTA initialized.");
+  #endif
+}
+
+void publishToThingSpeak(float temperature, float humidity, float pressure, float mqRaw, float vbatt) {
+  // Prepare HTTP client
+  Serial.println("Publishing to ThingSpeak...");
+  String url = String("/update?api_key=") + THINGSPEAK_WRITE_APIKEY +
+               "&field1=" + String(temperature, 2) +
+               "&field2=" + String(humidity, 2) +
+               "&field3=" + String(pressure, 2) +
+               "&field4=" + String(mqRaw, 1) +
+               "&field5=" + String(vbatt, 2);
+
+  #if defined(ESP8266)
+    HTTPClient http;
+    String serverPath = String("http://") + THINGSPEAK_SERVER + url;
+    http.begin(serverPath);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      Serial.printf("ThingSpeak response code: %d\n", httpCode);
+      String payload = http.getString();
+      Serial.println(payload);
+    } else {
+      Serial.printf("ThingSpeak request failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  #elif defined(ESP32)
+    HTTPClient http;
+    String serverPath = String("http://") + THINGSPEAK_SERVER + url;
+    http.begin(serverPath);
+    int httpCode = http.GET();
+    if (httpCode > 0) {
+      Serial.printf("ThingSpeak response code: %d\n", httpCode);
+      String payload = http.getString();
+      Serial.println(payload);
+    } else {
+      Serial.printf("ThingSpeak request failed, error: %s\n", http.errorToString(httpCode).c_str());
+    }
+    http.end();
+  #endif
+}
+
+void publishToMQTT(float temperature, float humidity, float pressure, float mqRaw, float vbatt) {
+  if (!USE_MQTT) return;
+  if (!mqttClient.connected()) {
+    Serial.println("MQTT not connected; attempting reconnect.");
+    if (!mqttClient.connect("weatherstationClient")) {
+      Serial.println("MQTT reconnect failed.");
+      return;
+    }
+  }
+  StaticJsonDocument<256> doc;
+  doc["device"] = OTA_HOSTNAME;
+  doc["t"] = temperature;
+  doc["h"] = humidity;
+  doc["p"] = pressure;
+  doc["mq"] = mqRaw;
+  doc["vbat"] = vbatt;
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+  String topic = String(MQTT_TOPIC_PREFIX) + "/telemetry";
+  mqttClient.publish(topic.c_str(), buf, n);
+  Serial.println("Published to MQTT.");
+}
+
+float readBatteryVoltage() {
+  // Read analog, scale using divider and Vref
+  #if defined(ESP8266)
+    // Note: A0 on NodeMCU has onboard divider. Use direct reading guidelines for your board.
+    int raw = analogRead(A0);
+    float volts = (raw / ADC_MAX) * VREF * VBAT_DIVIDER_RATIO;
+    return volts;
+  #elif defined(ESP32)
+    // ESP32 ADC needs attenuation config, assume default attenuation set by hardware
+    int raw = analogRead(PIN_BATT);
+    // Correction for ADC non-linearity recommended, but we'll use linear conversion
+    float volts = (raw / ADC_MAX) * VREF * VBAT_DIVIDER_RATIO;
+    return volts;
+  #endif
+}
+
+float readMQ135Raw() {
+  // Simple read of analog pin, return raw ADC value or scaled voltage
+  int raw = analogRead(PIN_MQ135);
+  // Convert to voltage
+  float v = (raw / ADC_MAX) * VREF;
+  // Return raw ADC or voltage depending on preference — here we return raw ADC for trend monitoring
+  // To get ppm: complex calibration required. Use libraries if you need ppm conversion.
+  return (float)raw; 
+}
+
+void displayStatus(float temperature, float humidity, float pressure, float mqRaw, float vbatt) {
+  if (!USE_OLED) return;
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0,0);
+  display.printf("IP: %s\n", WiFi.localIP().toString().c_str());
+  display.printf("T: %.2f C\n", temperature);
+  display.printf("H: %.2f %%\n", humidity);
+  display.printf("P: %.2f hPa\n", pressure);
+  display.printf("MQ: %.0f\n", mqRaw);
+  display.printf("V: %.2f V\n", vbatt);
+  display.display();
+}
+
+void doDeepSleep() {
+  // For ESP32: use esp_sleep_enable_timer_wakeup()
+  #if defined(ESP32)
+    esp_sleep_enable_timer_wakeup((uint64_t)DEEP_SLEEP_SECONDS * 1000000ULL);
+    Serial.printf("Sleeping for %llu seconds...\n", DEEP_SLEEP_SECONDS);
+    esp_deep_sleep_start();
+  #elif defined(ESP8266)
+    // ESP8266 deep sleep requires connecting RST to D0 and use function below
+    Serial.printf("ESP8266 deep sleep for %llu seconds (msleep uses microseconds) ...\n", DEEP_SLEEP_SECONDS);
+    ESP.deepSleep(DEEP_SLEEP_SECONDS * 1000000ULL);
+  #endif
+}Code of peoject
