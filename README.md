@@ -1,0 +1,2 @@
+# Design-and-development-of-IOT-Based-Solar-Powered-wifi-wheather-station
+Weather data such as temperature, humidity, atmospheric pressure, and air quality play an important role in environmental monitoring, agriculture, and smart city applications. Traditional weather stations are costly and require manual monitoring. This project solves these issues by creating a low-cost, IoT-based, solar-powered weather station.
